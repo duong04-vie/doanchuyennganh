@@ -1,429 +1,281 @@
-/*
-  ESP32 - Soil + Water Level + OLED + Firebase REST (no ArduinoJson)
-  Works with your Android app (reads manual_override / pump_state / buzzer_state)
-  Uses public Realtime DB (no auth). Make sure your rules allow read/write.
-*/
-
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <time.h>
-
-// ---------------- CONFIG ----------------
+#include <ArduinoJson.h> 
+// ================== WIFI + FIREBASE ==================
 #define WIFI_SSID      "TP-Link_0528"
 #define WIFI_PASSWORD  "34688946"
-#define DATABASE_URL   "https://doan-5d191-default-rtdb.firebaseio.com" // no trailing '/'
+#define DATABASE_URL   "https://doan-5d191-default-rtdb.firebaseio.com"
 
-// Hardware pins
-#define SOIL_PIN    34   // ADC1_CH6
+// ================== PIN ==================
+#define SOIL_PIN    34
 #define TRIG_PIN    18
 #define ECHO_PIN    19
-#define RELAY_PIN   17   // check relay active HIGH/LOW
+#define RELAY_PIN   17
 #define BUZZER_PIN  16
 
-// OLED
+// ================== OLED ==================
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// Thresholds
-#define NGUONG_DAT_KHO 30
-#define NGUONG_DAT_QUA_AM 85
-#define NGUONG_MUC_NUOC 15  // cm
+// ================== NGUONG ==================
+#define NGUONG_KHO        30
+#define NGUONG_TOT        60
+#define NGUONG_AM         85
+#define NGUONG_MUC_NUOC   7   // cm
 
-// Timing
-const unsigned long SENSOR_INTERVAL = 5000UL;
-const unsigned long FIREBASE_INTERVAL = 30000UL;
-const int HISTORY_MAX = 20;
+// ================== TIMER ==================
+unsigned long lastLoop = 0;
+unsigned long lastFirebase = 0;
+#define FIREBASE_INTERVAL 30000
 
-// Globals
-unsigned long lastSensorTime = 0;
-unsigned long lastFirebaseTime = 0;
-
-// Manual control values received from app
+// ================== MANUAL ==================
 bool manual_override = false;
 bool pump_state_from_db = false;
 bool buzzer_state_from_db = false;
 
-// ---------- Helpers: HTTP to Firebase (no auth) ----------
-String firebaseUrl(const String &pathAndQuery) {
-  // pathAndQuery should start with '/'
-  return String(DATABASE_URL) + pathAndQuery;
+// ================== FIREBASE HELPER ==================
+String firebaseUrl(String path) {
+  return String(DATABASE_URL) + path;
 }
 
-bool httpGET(const String &url, String &outBody, int timeout = 10000) {
+bool httpGET(String url, String &out) {
   HTTPClient http;
-  http.setTimeout(timeout);
   http.begin(url);
   int code = http.GET();
-  if (code > 0) {
-    outBody = http.getString();
-    http.end();
-    return true;
-  } else {
-    http.end();
-    return false;
-  }
+  if (code > 0) out = http.getString();
+  http.end();
+  return code > 0;
 }
 
-bool httpPUT(const String &url, const String &payload, String &outBody, int timeout = 10000) {
+bool httpPUT(String url, String payload) {
   HTTPClient http;
-  http.setTimeout(timeout);
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
   int code = http.PUT(payload);
-  if (code > 0) outBody = http.getString();
   http.end();
-  return (code == 200 || code == 204 || code == 201);
+  return (code == 200 || code == 201 || code == 204);
 }
 
-bool httpDELETE(const String &url, String &outBody, int timeout = 10000) {
+bool httpDELETE(String url) {
   HTTPClient http;
-  http.setTimeout(timeout);
   http.begin(url);
   int code = http.sendRequest("DELETE");
-  if (code > 0) outBody = http.getString();
   http.end();
-  return (code == 200 || code == 204);
+  return (code == 200 || code == 201 || code == 204);
 }
 
-// ---------- Simple JSON helpers (string-based parsing) ----------
-int countTopLevelKeys(const String &jsonObj) {
-  // Expect "{}" or {"k1":...,"k2":...}
-  // Return 0 if empty or not object.
-  if (jsonObj.length() < 2) return 0;
-  int count = 0;
-  bool inQuotes = false;
-  for (size_t i = 0; i < jsonObj.length(); ++i) {
-    char c = jsonObj[i];
-    if (c == '"') {
-      // increment if this quote starts a key: check previous non-space is '{' or ','
-      // find previous nonspace
-      size_t j = i;
-      while (j > 0) {
-        --j;
-        if (!isSpace(jsonObj[j])) break;
-      }
-      // If previous non-space is '{' or ',' then this is start of a key
-      if (jsonObj[j] == '{' || jsonObj[j] == ',') count++;
-      // skip to next quote
-      ++i;
-      while (i < jsonObj.length() && jsonObj[i] != '"') i++;
-    }
-  }
-  return count;
-}
-
-String getFirstKeyFromObject(const String &jsonObj) {
-  // parse first key name: assumes object like {"key":...}
-  int firstQuote = jsonObj.indexOf('\"');
-  if (firstQuote == -1) return "";
-  int secondQuote = jsonObj.indexOf('\"', firstQuote + 1);
-  if (secondQuote == -1) return "";
-  return jsonObj.substring(firstQuote + 1, secondQuote);
-}
-
-bool jsonIsTrue(const String &body) {
-  // body may be "true", "false", or "\"string\"", or number without quotes.
-  String s = body;
+bool jsonIsTrue(String s) {
   s.trim();
-  if (s == "true") return true;
-  return false;
+  return (s == "true");
 }
 
-long jsonToLong(const String &body) {
-  String s = body;
-  s.trim();
-  // if quoted string, strip quotes
-  if (s.startsWith("\"") && s.endsWith("\"") && s.length() >= 2) {
-    s = s.substring(1, s.length() - 1);
-  }
-  return s.toInt();
-}
-
-// ---------- Sensors ----------
+// ================== SENSOR ==================
 int readSoilPercent() {
-  int adc = analogRead(SOIL_PIN); // 0..4095
-  // calibrate these values on your sensor. Example values:
-  const int DRY_ADC = 3900;
-  const int WET_ADC = 1500;
+  int adc = analogRead(SOIL_PIN);
+  const int DRY_ADC = 4095;
+  const int WET_ADC = 1400;
   int pct = map(adc, DRY_ADC, WET_ADC, 0, 100);
-  pct = constrain(pct, 0, 100);
-  Serial.printf("Soil ADC=%d -> %d%%\n", adc, pct);
-  return pct;
+  return constrain(pct, 0, 100);
+}
+
+String soilText(int soil) {
+  if (soil < NGUONG_KHO) return "Kho";
+  if (soil <= NGUONG_TOT) return "Tot";
+  if (soil <= NGUONG_AM)  return "Am";
+  return "Sat lo";
 }
 
 long readWaterLevel() {
+  digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
-  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 30000);
-  if (duration == 0) return -1;
-  long cm = (long)(duration * 0.0343 / 2.0);
-  return cm;
+  unsigned long d = pulseIn(ECHO_PIN, HIGH, 30000);
+  if (d == 0) return -1;
+  return d * 0.0343 / 2;
 }
 
-String getCurrentTimeForKey() {
-  struct tm t;
-  if (!getLocalTime(&t)) return String(millis()); // fallback
-  char buf[32];
-  strftime(buf, sizeof(buf), "%Y-%m-%d_%H-%M-%S", &t);
-  return String(buf);
-}
-
-String getNiceTime() {
+String getTimeNow() {
   struct tm t;
   if (!getLocalTime(&t)) return "--:--:--";
-  char buf[32];
-  strftime(buf, sizeof(buf), "%H:%M:%S %d/%m", &t);
+  char buf[20];
+  strftime(buf, sizeof(buf), "%H:%M:%S", &t);
   return String(buf);
 }
 
-// ---------- Firebase-specific operations (unauth) ----------
-bool writeRealtimeInt(const String &key, long value) {
-  String url = firebaseUrl("/realtime_sensors/" + key + ".json");
-  String payload = String(value);
-  String resp;
-  return httpPUT(url, payload, resp);
+String getDateTimeNow() {
+  struct tm t;
+  if (!getLocalTime(&t)) return "----/--/-- --:--:--";
+  char buf[20];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
+  return String(buf);
 }
 
-bool writeRealtimeBool(const String &key, bool value) {
-  String url = firebaseUrl("/realtime_sensors/" + key + ".json");
-  String payload = value ? "true" : "false";
-  String resp;
-  return httpPUT(url, payload, resp);
+String getTimestampKey() {
+  struct tm t;
+  if (!getLocalTime(&t)) return "0000-00-00-00-00-00";
+  char buf[20];
+  strftime(buf, sizeof(buf), "%Y-%m-%d-%H-%M-%S", &t);
+  return String(buf);
 }
 
-bool writeRealtimeString(const String &key, const String &value) {
-  String url = firebaseUrl("/realtime_sensors/" + key + ".json");
-  String payload = "\"" + value + "\"";
-  String resp;
-  return httpPUT(url, payload, resp);
-}
-
-bool pushHistoryEntry(int soil, long water, bool pump, bool buzzer) {
-  String key = getCurrentTimeForKey();
-  String url = firebaseUrl("/history/" + key + ".json");
-  // build small JSON manually
-  String payload = "{";
-  payload += "\"soil_moisture\":" + String(soil) + ",";
-  payload += "\"water_level\":" + String(water) + ",";
-  payload += "\"pump_state\":" + String(pump ? "true" : "false") + ",";
-  payload += "\"buzzer_state\":" + String(buzzer ? "true" : "false");
-  payload += "}";
-  String resp;
-  return httpPUT(url, payload, resp);
-}
-
-int getHistoryCountShallow() {
-  String url = firebaseUrl("/history.json?shallow=true");
+// ================== MANUAL FETCH ==================
+void fetchManualControl() {
   String body;
-  if (!httpGET(url, body)) return -1;
-  body.trim();
-  if (body == "null" || body == "{}") return 0;
-  int cnt = countTopLevelKeys(body);
-  return cnt;
-}
+  if (httpGET(firebaseUrl("/realtime_sensors/manual_override.json"), body))
+    manual_override = jsonIsTrue(body);
 
-String getOldestHistoryKey() {
-  // orderBy="$key"&limitToFirst=1 -> returns {"oldestKey": { ... }}
-  String url = firebaseUrl("/history.json?orderBy=%22$key%22&limitToFirst=1");
-  String body;
-  if (!httpGET(url, body)) return "";
-  body.trim();
-  if (body.length() < 5) return "";
-  return getFirstKeyFromObject(body);
-}
-
-bool deleteHistoryKey(const String &key) {
-  if (key.length() == 0) return false;
-  String url = firebaseUrl("/history/" + key + ".json");
-  String resp;
-  return httpDELETE(url, resp);
-}
-
-// Read manual control values from Firebase (no auth)
-void fetchManualControlFromDB() {
-  String body;
-  // manual_override
-  if (httpGET(firebaseUrl("/realtime_sensors/manual_override.json"), body)) {
-    bool val = jsonIsTrue(body);
-    manual_override = val;
-  }
-  // pump_state (when manual_override true, app writes pump_state to control pump)
-  if (httpGET(firebaseUrl("/realtime_sensors/pump_state.json"), body)) {
+  if (httpGET(firebaseUrl("/realtime_sensors/pump_state.json"), body))
     pump_state_from_db = jsonIsTrue(body);
-  }
-  // buzzer_state
-  if (httpGET(firebaseUrl("/realtime_sensors/buzzer_state.json"), body)) {
+
+  if (httpGET(firebaseUrl("/realtime_sensors/buzzer_state.json"), body))
     buzzer_state_from_db = jsonIsTrue(body);
-  }
 }
 
-// ---------- Setup ----------
+// ================== SETUP ==================
 void setup() {
   Serial.begin(115200);
-  delay(50);
 
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);
   pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
-  // OLED
   Wire.begin(21, 22);
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("SSD1306 init failed");
-    for (;;) delay(10);
-  }
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+
   display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
-  display.setCursor(0, 10);
-  display.println("Connecting WiFi...");
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 20);
+  display.println("Dang ket noi WiFi...");
   display.display();
 
-  // Connect WiFi
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting WiFi");
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
-    delay(300);
-    Serial.print(".");
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi connected");
-  } else {
-    Serial.println("\nWiFi failed");
-  }
+  while (WiFi.status() != WL_CONNECTED) delay(300);
 
-  // NTP
-  configTime(25200, 0, "pool.ntp.org", "time.nist.gov");
-  struct tm timeinfo;
-  int retry = 0;
-  while (!getLocalTime(&timeinfo) && retry < 30) {
-    delay(200);
-    retry++;
-  }
-
-  display.clearDisplay();
-  display.setCursor(0, 10);
-  display.println("System Ready!");
-  display.display();
-  delay(800);
+  configTime(25200, 0, "pool.ntp.org");
 }
 
-// ---------- Loop ----------
+// ================== LOOP ==================
 void loop() {
   unsigned long now = millis();
 
-  // fetch manual control from DB more frequently
-  if (now - lastSensorTime > 1000) {
-    lastSensorTime = now;
-    fetchManualControlFromDB();
+  if (now - lastLoop > 1000) {
+    lastLoop = now;
+
+    fetchManualControl();
 
     int soil = readSoilPercent();
+    String soil_state = soilText(soil);
     long water = readWaterLevel();
 
-    bool pump_on = false;
-    bool buzzer_on = false;
+    bool pump = false;
+    bool buzzer = false;
     String status = "";
 
-    if (manual_override) {
-      // When manual mode: follow pump_state_from_db & buzzer_state_from_db
-      pump_on = pump_state_from_db;
-      buzzer_on = buzzer_state_from_db;
-      status = "Manual - Pump: " + String(pump_on ? "ON" : "OFF") + " Buzzer: " + String(buzzer_on ? "ON" : "OFF");
-    } else {
-      bool datKho = (soil < NGUONG_DAT_KHO);
-      bool datQuaAm = (soil > NGUONG_DAT_QUA_AM);
-      bool luLut = (water >= 0 && water < NGUONG_MUC_NUOC);
+    bool luLut = (water >= 0 && water < NGUONG_MUC_NUOC);
 
-      if (luLut || datQuaAm) {
-        pump_on = false;
-        buzzer_on = true;
-        status = luLut ? "! CANH BAO LU !" : "! SAT LO DAT !";
+    if (manual_override) {
+      pump = pump_state_from_db;
+      buzzer = buzzer_state_from_db;
+      status = "CHE DO TAY";
+
+    } else {
+      if (luLut) {
+        pump = false;
+        buzzer = true;
+        status = "CANH BAO LU!";
+
+      } else if (soil_state == "Sat lo") {
+        pump = false;
+        buzzer = true;
+        status = "SAT LO DAT!";
+
+      } else if (soil_state == "Kho") {
+        pump = true;
+        buzzer = false;
+        status = "DANG TUOI NUOC";
+
       } else {
-        buzzer_on = false;
-        pump_on = datKho;
-        status = pump_on ? "Dang Tuoi Nuoc..." : "Trang thai tot";
+        pump = false;
+        buzzer = false;
+        status = "TRANG THAI ON";
       }
     }
 
-    // Apply to hardware
-    digitalWrite(RELAY_PIN, pump_on ? HIGH : LOW);
-    digitalWrite(BUZZER_PIN, buzzer_on ? HIGH : LOW);
+    digitalWrite(RELAY_PIN, pump ? HIGH : LOW);
+    digitalWrite(BUZZER_PIN, buzzer ? HIGH : LOW);
 
-    // Update OLED
+    // -------- OLED --------
     display.clearDisplay();
     display.setCursor(0, 0);
-    display.print("Time: "); display.println(getNiceTime());
-    display.setCursor(0, 15);
-    display.printf("Do am dat: %d %%\n", soil);
-    display.setCursor(0, 28);
-    if (water >= 0) display.printf("Muc nuoc: %ld cm\n", water);
-    else display.println("Muc nuoc: LOI");
-    display.setCursor(0, 44);
+    display.print("Time: "); display.println(getTimeNow());
+
+    display.setCursor(0, 16);
+    display.print("Do am dat: ");
+    display.println(soil_state);
+
+    display.setCursor(0, 30);
+    display.print("Muc nuoc: ");
+    if (water >= 0) display.print(String(water) + " cm");
+    else display.print("LOI");
+
+    display.setCursor(0, 46);
     display.println(status);
     display.display();
   }
 
-  // Push data to Firebase periodically
-  if (WiFi.status() == WL_CONNECTED && (now - lastFirebaseTime > FIREBASE_INTERVAL)) {
-    lastFirebaseTime = now;
+  // -------- FIREBASE --------
+  if (WiFi.status() == WL_CONNECTED && now - lastFirebase > FIREBASE_INTERVAL) {
+    lastFirebase = now;
 
     int soil = readSoilPercent();
     long water = readWaterLevel();
-    bool pump_on = (digitalRead(RELAY_PIN) == HIGH);
-    bool buzzer_on = (digitalRead(BUZZER_PIN) == HIGH);
+    String soil_text = soilText(soil);
+    String datetime = getDateTimeNow();
+    String key = getTimestampKey();
 
-    // Update realtime sensors
-    writeRealtimeInt("doam", soil);
-    writeRealtimeInt("mucnuoc", water);
-    writeRealtimeString("last_update", getNiceTime());
+    httpPUT(firebaseUrl("/realtime_sensors/doam.json"), String(soil));
+    httpPUT(firebaseUrl("/realtime_sensors/doam_text.json"), "\"" + soil_text + "\"");
+    httpPUT(firebaseUrl("/realtime_sensors/mucnuoc.json"), String(water));
+    httpPUT(firebaseUrl("/realtime_sensors/trangthai.json"), "\"" + String(digitalRead(BUZZER_PIN) ? "CANH BAO" : "BINH THUONG") + "\"");
 
-    // If not manual override, write pump_state/buzzer_state reflecting automatic control
-    if (!manual_override) {
-      writeRealtimeBool("pump_state", pump_on);
-      writeRealtimeBool("buzzer_state", buzzer_on);
-    } else {
-      // If manual_override true, we still write the current pump_state key so app stays consistent
-      writeRealtimeBool("pump_state", pump_on);
-      writeRealtimeBool("buzzer_state", buzzer_on);
-    }
-
-    // push history
-    pushHistoryEntry(soil, water, pump_on, buzzer_on);
-
-    // clean history if > HISTORY_MAX
-    int cnt = getHistoryCountShallow();
-    if (cnt > HISTORY_MAX) {
-      Serial.printf("History count = %d, pruning...\n", cnt);
-      String oldest = getOldestHistoryKey();
-      if (oldest.length()) {
-        if (deleteHistoryKey(oldest)) {
-          Serial.printf("Deleted oldest: %s\n", oldest.c_str());
-        } else {
-          Serial.printf("Failed to delete oldest: %s\n", oldest.c_str());
-        }
-      } else {
-        Serial.println("No oldest key found for deletion");
+    String shallow_url = firebaseUrl("/history.json?shallow=true");
+    String shallow_body;
+    size_t count = 0;
+    if (httpGET(shallow_url, shallow_body)) {
+      DynamicJsonDocument doc(2048);  // Du phong cho nhieu key
+      DeserializationError error = deserializeJson(doc, shallow_body);
+      if (!error) {
+        count = doc.size();
       }
     }
-    Serial.println("Firebase sync done.");
+    if (count >= 20) {
+      String query_url = firebaseUrl("/history.json?orderBy=\"$key\"&limitToFirst=1");
+      String query_body;
+      if (httpGET(query_url, query_body)) {
+        DynamicJsonDocument qdoc(1024);
+        DeserializationError qerror = deserializeJson(qdoc, query_body);
+        if (!qerror) {
+          JsonObject root = qdoc.as<JsonObject>();
+          if (root.size() > 0) {
+            String old_key = root.begin()->key().c_str();
+            String del_url = firebaseUrl("/history/" + old_key + ".json");
+            httpDELETE(del_url);
+          }
+        }
+      }
+    }
+    String payload = "{\"doam\":" + String(soil) + ", \"doam_text\":\"" + soil_text + "\", \"mucnuoc\":" + String(water) + ", \"datetime\":\"" + datetime + "\"}";
+    String put_url = firebaseUrl("/history/" + key + ".json");
+    httpPUT(put_url, payload);
+    httpPUT(firebaseUrl("/realtime_sensors/last_update.json"), "\"" + datetime + "\"");
   }
-
-  // wifi reconnect non-blocking
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.reconnect();
-  }
-
   delay(10);
 }
